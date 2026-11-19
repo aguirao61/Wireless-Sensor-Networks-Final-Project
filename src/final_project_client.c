@@ -1,0 +1,359 @@
+#include "contiki.h"
+
+// 6LowPAN libs
+#include "net/routing/routing.h"
+#include "net/netstack.h"
+#include "net/ipv6/simple-udp.h"
+#include "net/ipv6/uiplib.h"
+
+// port defines
+#define UDP_CLIENT_PORT 8765
+#define UDP_SERVER_PORT 5678
+
+// LED states
+#define LED_ON 1
+#define LED_OFF 0
+
+// message definition
+#define MY_MESSAGE "CLIENT: Message sent to the server"
+#define RECURRING_MESSAGE "recurring call"
+#define CONEXION_ESTABLISHED "CLIENT: Conexion with the server established"
+
+// imu logic defines
+#define FALL_MSG "CLIENT: FALL DETECTED"
+#define ACCEL_IMPACT_THRESHOLD_G 2.6f
+#define GYRO_ROTATION_THRESHOLD_DPS 250.0f
+#define FALL_COOLDOWN_TICKS (CLOCK_SECOND * 5)
+
+// normal includes
+#include <stdio.h> /* For printf() */
+#include <stdlib.h>
+#include "leds.h"
+#include "serial-line.h"
+#include "string.h"
+
+// includes cookies
+#include "efr32mg12p432f1024gl125.h"
+#include "em_cmu.h"
+#include "em_emu.h"
+#include "si7021.h"
+#include "board_cookie.h"
+#include "util.h"
+#include "imu.h"        // For IMU
+#include "icm20648.h"   // For IMU
+
+// auxilary processes
+static process_event_t udp_data_event;
+static struct simple_udp_connection udp_conn;
+
+// auxilary global variables
+static uip_ipaddr_t dest_address;
+static uint8_t dest_address_valid = 0;
+
+/*---------------------------------------------------------------------------*/
+PROCESS(udp_client_proc, "client proc");
+PROCESS(server_call_proc, "recurring server call");
+AUTOSTART_PROCESSES(&udp_client_proc, &server_call_proc);
+
+/*---------------------------------------------------------------------------*/
+// Client callback, handled by scheduler
+static void udp_rx_callback(
+        struct simple_udp_connection *c,
+        const uip_ipaddr_t *source_addr,
+        uint16_t source_port,
+        const uip_ipaddr_t *dest_addr,
+        uint16_t dest_port,
+        const uint8_t *data,
+        uint16_t datalen
+        ) {
+
+    printf("Received packet from: ");
+    uiplib_ipaddr_print(source_addr);
+    printf(", Data: %s\n", (char*)data);
+
+    printf("CLIENT [Request][Time: %lu s]: Command: %s. Received from address ",
+        (unsigned long)(clock_time() / CLOCK_SECOND),
+        (char*)data
+    );
+    uiplib_ipaddr_print(source_addr);
+    printf("\n");
+
+    // notify client process that data has been sent
+    process_post(&udp_client_proc, udp_data_event, (void *)data);
+}
+
+// sqrt function to avoid math.h as its very heavy. additional header option: fr_math
+float my_sqrt(float x) {
+    if (x < 0) return -1.0; // NaN equivalente
+    if (x == 0) return 0.0;
+    float y = x;
+    float prev;
+    do {
+        prev = y;
+        y = 0.5 * (y + x / y);
+    } while (y - prev > 1e-12 * y || prev - y > 1e-12 * y);
+    return y;
+}
+
+// accelerometer and gyropscope setup
+uint8_t imuSetup(uint8_t enable_calibration)
+{
+    static uint32_t status;
+    static float accel_bias[3] = {0.0f, 0.0f, 0.0f};
+    static float gyro_bias[3]  = {0.0f, 0.0f, 0.0f};
+
+    // calibration (only when device starts flat & stationary)
+    if (enable_calibration) {
+        status = ICM20648_accelGyroCalibrate(accel_bias, gyro_bias);
+        if (status != ICM20648_OK) {
+            printf(
+                "CLIENT: IMU calibration failed (%lu)\n",
+                (unsigned long)status
+            );
+            return 0;
+        }
+        printf(
+            "CLIENT: IMU calibrated (accel bias g: X=%d Y=%d Z=%d / 1000)\n",
+            (int)(accel_bias[0] * 1000.0f),
+            (int)(accel_bias[1] * 1000.0f),
+            (int)(accel_bias[2] * 1000.0f)
+        );
+    }
+
+    // enable accelerometer + gyroscope (disable magnetometer/compass)
+    status = ICM20648_sensorEnable(true, true, false);
+    if (status != ICM20648_OK) {
+        printf("CLIENT: IMU sensorEnable failed (%lu)\n", (unsigned long)status);
+        return 0;
+    }
+
+    // disable low-power cycle mode: for steady continuous sampling
+    status = ICM20648_cycleModeEnable(false);
+    if (status != ICM20648_OK) {
+        printf("CLIENT: IMU cycleModeEnable failed (%lu)\n", (unsigned long)status);
+        return 0;
+    }
+
+    // set sample rate (~100 Hz)
+    ICM20648_sampleRateSet(100.0f);
+
+    // set anti-aliasing low-pass filter bandwidths
+    status = ICM20648_accelBandwidthSet(ICM20648_ACCEL_BW_50HZ);
+    if (status != ICM20648_OK) {
+        printf("CLIENT: IMU accelBandwidthSet failed (%lu)\n", (unsigned long)status);
+        return 0;
+    }
+
+    status = ICM20648_gyroBandwidthSet(ICM20648_GYRO_BW_51HZ);
+    if (status != ICM20648_OK) {
+        printf("CLIENT: IMU gyroBandwidthSet failed (%lu)\n", (unsigned long)status);
+        return 0;
+    }
+
+    // set full-scale ranges suited for fall detection
+    status = ICM20648_accelFullscaleSet(ICM20648_ACCEL_FULLSCALE_8G);
+    if (status != ICM20648_OK) {
+        printf("CLIENT: IMU accelFullscaleSet failed (%lu)\n", (unsigned long)status);
+        return 0;
+    }
+
+    status = ICM20648_gyroFullscaleSet(ICM20648_GYRO_FULLSCALE_500DPS);
+    if (status != ICM20648_OK) {
+        printf("CLIENT: IMU gyroFullscaleSet failed (%lu)\n", (unsigned long)status);
+        return 0;
+    }
+
+    printf("CLIENT: ICM20648 ready (8g, 500dps, ~100Hz)\n");
+    return 1;
+}
+
+// sensor setup
+void sensorSetup(void) {
+    GPIO_PinModeSet(gpioPortF, 9, gpioModePushPull, 1);
+    GPIO_PinOutSet(gpioPortF, 9);
+    I2CSPM_Init_TypeDef i2cspmInit = I2CSPM_INIT_DEFAULT;
+    I2CSPM_Init(&i2cspmInit);
+    SI7021_init();
+}
+
+/*---------------------------------------------------------------------------*/
+PROCESS_THREAD(udp_client_proc, ev, data)
+{
+    // buffer data
+    char buffer[128];
+
+    // setup auxilaries
+    static uint8_t is_imu_success = 0; // imu setup seccessful = 1, other = 0
+
+    // communication variables
+    static struct etimer setup_timer;
+    static char communication_setup_flag = 0;
+    static int counter = 0;
+
+    // imu varibles
+    static struct etimer imu_poll_timer;
+    static float accel[3] = {0.0f, 0.0f, 0.0f}; // [x, y, z] in g
+    static float gyro[3]  = {0.0f, 0.0f, 0.0f}; // [x, y, z] in deg/s
+    static clock_time_t last_fall_alert_time = 0;
+    static uint8_t freefall_seen = 0;
+    static clock_time_t freefall_time = 0;
+
+    PROCESS_BEGIN();
+
+    // Allocate event process
+    udp_data_event = process_alloc_event();
+
+    // 'START' CLIENT
+    printf("CLIENT: Started\n");
+
+    // Register UDP socket
+    simple_udp_register(
+        &udp_conn,
+        UDP_CLIENT_PORT,
+        NULL,
+        UDP_SERVER_PORT,
+        udp_rx_callback
+    );
+
+    // Boot up server-client connection
+    etimer_set(&setup_timer, CLOCK_SECOND);
+
+    while(!communication_setup_flag) {
+
+        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&setup_timer));
+
+        // Connect to the server
+        if(
+            NETSTACK_ROUTING.node_is_reachable &&
+            NETSTACK_ROUTING.get_root_ipaddr(&dest_address)
+        ){
+            dest_address_valid = 1;
+
+            // Send the info to the server message
+            simple_udp_sendto(&udp_conn, MY_MESSAGE, sizeof(MY_MESSAGE), &dest_address);
+
+            printf(
+                "CLIENT [Confirmation][Time: %lu s]: Communication attempt %d with the server\n",
+                (unsigned long)(clock_time() / CLOCK_SECOND),
+                counter
+            );
+            counter++;
+
+            if(counter < 20) {
+
+                communication_setup_flag = 0;
+
+            } else {
+                communication_setup_flag = 1;
+                printf(
+                    "CLIENT [Time: %li s]: Conexion with the server established\n",
+                    (unsigned long)(clock_time() / CLOCK_SECOND)
+                );
+                simple_udp_sendto(
+                    &udp_conn,
+                    CONEXION_ESTABLISHED,
+                    sizeof(CONEXION_ESTABLISHED),
+                    &dest_address
+                );
+
+                etimer_stop(&setup_timer); // stop the timer once no longer needed
+            }
+
+        } else {
+            printf("Node not reachable atm\n");
+            etimer_reset(&setup_timer); // reset timer only when timer is needed
+        }
+    }
+
+    sensorSetup();
+    is_imu_success = imuSetup((uint8_t)1); // enable_calibration = 1
+
+    if(!is_imu_success) {
+        is_imu_success = imuSetup((uint8_t)1);
+    } else {
+        // do nothing: imu setup seccessful
+    }
+
+    // processing logic
+    if (is_imu_success) {
+        // ~50 Hz sampling (20 ms)
+        etimer_set(&imu_poll_timer, CLOCK_SECOND / 50);
+
+        while (1) {
+            PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&imu_poll_timer));
+
+            if (
+                ICM20648_accelDataRead(accel) == ICM20648_OK &&
+                ICM20648_gyroDataRead(gyro) == ICM20648_OK
+            ) {
+
+                float a_mag = my_sqrt(accel[0]*accel[0] + accel[1]*accel[1] + accel[2]*accel[2]);
+                float g_mag = my_sqrt(gyro[0]*gyro[0] + gyro[1]*gyro[1] + gyro[2]*gyro[2]);
+                clock_time_t now = clock_time();
+
+                // Track brief low-g drop (unweighting) within last 600 ms
+                if (a_mag < 0.55f) {
+                    freefall_seen = 1;
+                    freefall_time = now;
+                } else if (freefall_seen && ((now - freefall_time) > (CLOCK_SECOND * 6) / 10)) {
+                    freefall_seen = 0;
+                }
+
+                // Trigger if impact + rotation spike occurs (and cooldown has passed)
+                uint8_t impact_event = (a_mag > ACCEL_IMPACT_THRESHOLD_G) &&
+                                    (g_mag > GYRO_ROTATION_THRESHOLD_DPS);
+
+                if (impact_event &&
+                    (last_fall_alert_time == 0 || ((now - last_fall_alert_time) > FALL_COOLDOWN_TICKS))
+                ) {
+
+                    last_fall_alert_time = now;
+                    freefall_seen = 0;
+
+                    printf(
+                        "CLIENT [ALERT][Time: %lu s]: Fall detected! |a|=%d.%02d g |w|=%d dps\n",
+                        (unsigned long)(now / CLOCK_SECOND),
+                        (int)a_mag,
+                        (int)((a_mag - (int)a_mag) * 100.0f),
+                        (int)g_mag
+                    );
+
+                    // send message to server
+                    simple_udp_sendto(&udp_conn, FALL_MSG, sizeof(FALL_MSG), &dest_address);
+                }
+            }
+
+            etimer_reset(&imu_poll_timer);
+        }
+    }
+
+    PROCESS_END();
+}
+
+/*---------------------------------------------------------------------------*/
+// Process to keep server awake
+PROCESS_THREAD(server_call_proc, ev, data) {
+
+    PROCESS_BEGIN();
+
+    // timer setup 1 second
+    static struct etimer recurring_call_timer;
+    etimer_set(&recurring_call_timer, CLOCK_SECOND);
+
+    // infinite loop to keep the recurring call happening
+    while(1) {
+        // return control to scheduler until timer expires
+        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&recurring_call_timer));
+
+        // send message to server once timer expires once route is known
+        if (dest_address_valid) {
+            simple_udp_sendto(&udp_conn, RECURRING_MESSAGE, sizeof(RECURRING_MESSAGE), &dest_address);
+        }
+
+        // reset timer
+        etimer_reset(&recurring_call_timer);
+    }
+
+    PROCESS_END();
+}
+/*---------------------------------------------------------------------------*/
