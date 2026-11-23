@@ -180,7 +180,8 @@ void sensorSetup(void) {
 PROCESS_THREAD(udp_client_proc, ev, data)
 {
     // buffer data
-    char buffer[128];
+    char buffer_gyro[128];
+    char buffer_accel[128];
 
     // setup auxilaries
     static uint8_t is_imu_success = 0; // imu setup seccessful = 1, other = 0
@@ -265,7 +266,7 @@ PROCESS_THREAD(udp_client_proc, ev, data)
         }
     }
 
-    sensorSetup();
+    // imu setup
     is_imu_success = imuSetup((uint8_t)1); // enable_calibration = 1
 
     if(!is_imu_success) {
@@ -276,7 +277,7 @@ PROCESS_THREAD(udp_client_proc, ev, data)
 
     // processing logic
     if (is_imu_success) {
-        // ~50 Hz sampling (20 ms)
+        // ~50 Hz sampling (20 ms), normal human involuntary bandwidth 20 Hz.
         etimer_set(&imu_poll_timer, CLOCK_SECOND / 50);
 
         while (1) {
@@ -303,7 +304,8 @@ PROCESS_THREAD(udp_client_proc, ev, data)
                 uint8_t impact_event = (a_mag > ACCEL_IMPACT_THRESHOLD_G) &&
                                     (g_mag > GYRO_ROTATION_THRESHOLD_DPS);
 
-                if (impact_event &&
+                if (
+                    impact_event &&
                     (last_fall_alert_time == 0 || ((now - last_fall_alert_time) > FALL_COOLDOWN_TICKS))
                 ) {
 
