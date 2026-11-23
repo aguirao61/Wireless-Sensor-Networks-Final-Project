@@ -24,6 +24,7 @@
 #define ACCEL_IMPACT_THRESHOLD_G 2.6f
 #define GYRO_ROTATION_THRESHOLD_DPS 250.0f
 #define FALL_COOLDOWN_TICKS (CLOCK_SECOND * 5)
+#define SAMPLE_SIZE (60)
 
 // normal includes
 #include <stdio.h> /* For printf() */
@@ -179,9 +180,12 @@ void sensorSetup(void) {
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(udp_client_proc, ev, data)
 {
-    // buffer data
-    char buffer_gyro[128];
-    char buffer_accel[128];
+    // buffer data, 60 sample window
+    float buffer_gyro[60];
+    float buffer_accel[60];
+
+    // control auxialries
+    char buffer_control_aux = 0;
 
     // setup auxilaries
     static uint8_t is_imu_success = 0; // imu setup seccessful = 1, other = 0
@@ -277,7 +281,10 @@ PROCESS_THREAD(udp_client_proc, ev, data)
 
     // processing logic
     if (is_imu_success) {
-        // ~50 Hz sampling (20 ms), normal human involuntary bandwidth 20 Hz.
+        /* 
+        * ~50 Hz sampling (20 ms) 
+        * normal human involuntary bandwidth 20 Hz, 50 hz should be plenty for correct tracking of motion
+        */
         etimer_set(&imu_poll_timer, CLOCK_SECOND / 50);
 
         while (1) {
@@ -288,8 +295,25 @@ PROCESS_THREAD(udp_client_proc, ev, data)
                 ICM20648_gyroDataRead(gyro) == ICM20648_OK
             ) {
 
+                /*
+                * calculate magnitude and save it in buffer
+                * important so the measurament is independent of the orientation of the device
+                */
+                // calculate magnitudes
                 float a_mag = my_sqrt(accel[0]*accel[0] + accel[1]*accel[1] + accel[2]*accel[2]);
                 float g_mag = my_sqrt(gyro[0]*gyro[0] + gyro[1]*gyro[1] + gyro[2]*gyro[2]);
+                
+                // buffer window control, we never want more than 60 sample to process
+                if (buffer_control_aux < SAMPLE_SIZE) {
+                    buffer_control_aux++;
+                } else {
+                    buffer_control_aux = buffer_control_aux;
+                }
+
+                // save magnitudes into buffer in their corresponding spot
+                buffer_accel[buffer_control_aux] = a_mag;
+                buffer_gyro[buffer_control_aux] = g_mag;
+
                 clock_time_t now = clock_time();
 
                 // Track brief low-g drop (unweighting) within last 600 ms (1st phase. Free fall)
